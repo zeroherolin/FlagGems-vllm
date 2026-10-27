@@ -232,7 +232,7 @@ class FlashmlaSparseTestKit:
             for have_attn_sink in [True, False]
             for have_topk_length in [True, False]
         ]
-        # DeepSeek-V4-Flash prefill: TOPK split, small head blocks, 8 and 16 warps
+        # DeepSeek-V4-Flash prefill: TOPK splits and small head blocks
         cases += [
             Flashmla_Sparse_Test_Param(
                 s_q,
