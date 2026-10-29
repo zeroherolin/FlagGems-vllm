@@ -27,6 +27,7 @@ from flaggems_vllm.ops.FLA.fused_cumsum_kkt_solve_tril import (
     chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril,
 )
 from flaggems_vllm.utils import libentry
+from flaggems_vllm.utils.tle_capabilities import vendor_takes_tle_pipe_kernels
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle_attrs
 
 if has_triton_tle_attrs(
@@ -144,7 +145,11 @@ def _can_use_tle_chunk_gated_delta_rule(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None,
 ) -> bool:
-    if not (HAS_TLE_CHUNK_GATED_DELTA_RULE and _tle_chunk_gdr_enabled()):
+    if not (
+        HAS_TLE_CHUNK_GATED_DELTA_RULE
+        and _tle_chunk_gdr_enabled()
+        and vendor_takes_tle_pipe_kernels()
+    ):
         return False
     if not output_final_state:
         return False

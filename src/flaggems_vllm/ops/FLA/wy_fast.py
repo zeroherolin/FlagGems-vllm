@@ -13,6 +13,7 @@ import triton.language as tl
 
 from flaggems_vllm.ops.FLA.index import prepare_chunk_indices
 from flaggems_vllm.utils import libentry, libtuner
+from flaggems_vllm.utils.tle_capabilities import vendor_takes_tle_pipe_kernels
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle_attrs
 
 if has_triton_tle_attrs(("load",), 3, 6, 0):
@@ -34,13 +35,14 @@ def _use_tle_recompute_w_u(cu_seqlens: torch.Tensor | None) -> bool:
         HAS_TLE_RECOMPUTE_W_U
         and cu_seqlens is None
         and value not in {"0", "false", "off", "no"}
+        and vendor_takes_tle_pipe_kernels()
     )
 
 
 def maybe_set_tle_recompute_allocator(
     device: torch.device, cu_seqlens: torch.Tensor | None
 ) -> None:
-    if not (HAS_TLE_RECOMPUTE_W_U and cu_seqlens is None):
+    if not _use_tle_recompute_w_u(cu_seqlens):
         return
 
     def alloc_fn(size: int, align: int, stream):

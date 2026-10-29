@@ -26,6 +26,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.utils.tle_capabilities import vendor_takes_tle_pipe_kernels
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 if has_triton_tle(3, 6, 0):
@@ -1418,7 +1419,7 @@ def _can_use_tle_dense_decode(
     head_dim_v: int,
     page_block_size: int,
 ) -> bool:
-    if not (HAS_TLE and _tle_decode_enabled()):
+    if not (HAS_TLE and _tle_decode_enabled() and vendor_takes_tle_pipe_kernels()):
         return False
     if q.device.type != "cuda":
         return False
