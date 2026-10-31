@@ -25,6 +25,19 @@ import flaggems_vllm
 random.seed(42)
 
 
+@pytest.fixture(
+    autouse=True,
+    params=["inline_asm", "pipe"] if flaggems_vllm.vendor_name == "thead" else [None],
+)
+def kv_ring_path(request, monkeypatch):
+    """On PPU the kernel has two KV ring implementations (cp.async inline assembly, and
+    tle.pipe); the correctness tests cover both."""
+    if request.param is not None:
+        monkeypatch.setenv(
+            "FLAGGEMS_FLASHMLA_SPARSE_PIPE", "1" if request.param == "pipe" else "0"
+        )
+
+
 def _get_vllm_flashmla_sparse_reference():
     """Return vLLM's sparse FlashMLA op only when its extension is usable."""
     try:

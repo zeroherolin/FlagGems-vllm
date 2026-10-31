@@ -39,6 +39,7 @@ blocks and TOPK splits, merged by a combine kernel.
 """
 
 import functools
+import os
 from typing import Optional, Tuple
 
 import torch
@@ -117,6 +118,16 @@ _TLE_PRIMITIVES = (
     "gpu.barrier_arrive",
     "gpu.buffered_tensor.slot",
     "gpu.buffered_tensor.subslice",
+)
+_TLE_PIPE_PRIMITIVES = _TLE_PRIMITIVES + (
+    "pipe",
+    "pipe.writer",
+    "pipe.writer.acquire",
+    "pipe.writer.commit",
+    "pipe.reader",
+    "pipe.reader.wait",
+    "pipe.reader.release",
+    "gpu.copy",
 )
 
 
@@ -939,6 +950,578 @@ if tle is not None:
                 _store_o(o_ptr, BD, acc2, factor, BD, NS == 1)
                 _store_o(o_ptr, BD + HB, acc3, factor, BD, NS == 1)
 
+    # tle.pipe variant (FLAGGEMS_FLASHMLA_SPARSE_PIPE=1). The KV ring is one pipe: the QK
+    # group writes a position with tle.gpu.copy and is its own reader ("qk"), the PV group
+    # is the second reader ("pv"). The index ring is replaced by register-held indices.
+    @triton.jit
+    def _rows(buf, BH: tl.constexpr, BK: tl.constexpr):
+        """The first BH rows of a slot of BK rows."""
+        if BH == BK:
+            return buf
+        else:
+            return buf.subslice(0, BH, 0)
+
+    @triton.jit
+    def _write_q(
+        writer,
+        q,
+        tok,
+        h0,
+        p,
+        stride_qm,
+        stride_qh,
+        BH: tl.constexpr,
+        BK: tl.constexpr,
+        BD: tl.constexpr,
+        TD: tl.constexpr,
+    ):
+        """Write an item's Q rows to position p of the KV pipe."""
+        q_rows = q + tok * stride_qm + (h0 + tl.arange(0, BH)) * stride_qh
+        cols = tl.arange(0, BD)[None, :]
+        slot = writer.acquire(p)
+        tle.gpu.copy(q_rows[:, None] + cols, _rows(slot.k0, BH, BK), [BH, BD])
+        tle.gpu.copy(q_rows[:, None] + BD + cols, _rows(slot.k1, BH, BK), [BH, BD])
+        if TD > 0:
+            tcols = tl.arange(0, TD)[None, :]
+            tle.gpu.copy(
+                q_rows[:, None] + 2 * BD + tcols, _rows(slot.kt, BH, BK), [BH, TD]
+            )
+        writer.commit(p)
+
+    @triton.jit
+    def _write_kv(
+        writer,
+        kv,
+        ids,
+        SKV,
+        p,
+        stride_kvn,
+        BK: tl.constexpr,
+        BD: tl.constexpr,
+        TD: tl.constexpr,
+        KV_I64: tl.constexpr,
+    ):
+        """Write the key block with indices `ids` to position p of the KV pipe; invalid
+        keys are zero-filled."""
+        valid = _valid(ids, SKV)
+        row_ids = tl.where(valid, ids, 0)
+        if KV_I64:
+            rows = kv + row_ids.to(tl.int64) * stride_kvn
+        else:
+            rows = kv + row_ids * stride_kvn
+        cols = tl.arange(0, BD)[None, :]
+        mask = tl.broadcast_to(valid[:, None], (BK, BD))
+        slot = writer.acquire(p)
+        tle.gpu.copy(rows[:, None] + cols, slot.k0, [BK, BD], mask=mask)
+        tle.gpu.copy(rows[:, None] + BD + cols, slot.k1, [BK, BD], mask=mask)
+        if TD > 0:
+            tcols = tl.arange(0, TD)[None, :]
+            tle.gpu.copy(
+                rows[:, None] + 2 * BD + tcols,
+                slot.kt,
+                [BK, TD],
+                mask=tl.broadcast_to(valid[:, None], (BK, TD)),
+            )
+        writer.commit(p)
+
+    @triton.jit
+    def _scores_slot(q0, q1, sQT, ids, slot, sm_scale_log2, SKV, TD: tl.constexpr):
+        """Scores (log2 units, invalid keys -inf) of the key block in a KV pipe slot."""
+        k0 = tl.load(tle.gpu.local_ptr(slot.k0))
+        k1 = tl.load(tle.gpu.local_ptr(slot.k1))
+        if TD > 0:
+            kt = tl.load(tle.gpu.local_ptr(slot.kt))
+            s = tl.dot(tl.load(tle.gpu.local_ptr(sQT)), tl.trans(kt))
+            s = tl.dot(q0, tl.trans(k0), s)
+        else:
+            s = tl.dot(q0, tl.trans(k0))
+        s = tl.dot(q1, tl.trans(k1), s)
+        return tl.where(_valid(ids, SKV)[None, :], s * sm_scale_log2, float("-inf"))
+
+    @triton.jit
+    def _qk_group_pipe(
+        q,
+        kv,
+        indices,
+        topk_length,
+        writer,
+        qk_reader,
+        sQT,
+        sS,
+        ready,
+        sfree,
+        pid,
+        grid,
+        n_my,
+        TOPK,
+        nsplit,
+        chunk,
+        SKV,
+        sm_scale_log2,
+        stride_qm,
+        stride_qh,
+        stride_kvn,
+        stride_tm,
+        NHB: tl.constexpr,
+        HAVE_TOPK_LENGTH: tl.constexpr,
+        BH: tl.constexpr,
+        BK: tl.constexpr,
+        BD: tl.constexpr,
+        TD: tl.constexpr,
+        NS: tl.constexpr,
+        KV_I64: tl.constexpr,
+    ):
+        """The schedule of _qk_group with the KV ring as a pipe: position p holds the Q
+        rows of an item or one of its key blocks; step p reads position p, computes the
+        scores and writes position p + 2 (acquiring it waits until the PV group has
+        released position p - 1). The indices of the block written at a step are loaded
+        two steps ahead."""
+        tok, h0, _, lo, ln, nblk = _item(
+            0,
+            pid,
+            grid,
+            n_my,
+            topk_length,
+            TOPK,
+            nsplit,
+            chunk,
+            NHB,
+            BH,
+            BK,
+            HAVE_TOPK_LENGTH,
+        )
+        t_row = indices + tok * stride_tm + lo
+        a0 = _load_ids(t_row, 0, ln, BK)
+        _write_q(writer, q, tok, h0, 0, stride_qm, stride_qh, BH, BK, BD, TD)
+        _write_kv(writer, kv, a0, SKV, 1, stride_kvn, BK, BD, TD, KV_I64)
+        # loop-carried Q registers: placeholders until the first Q position
+        q0 = tl.zeros([BH, BD], dtype=tl.bfloat16)
+        q1 = tl.zeros([BH, BD], dtype=tl.bfloat16)
+        p = 0
+        r = 0
+        for k in range(n_my):
+            n_tok, n_h0, _, n_lo, n_ln, n_nblk = _item(
+                k + 1,
+                pid,
+                grid,
+                n_my,
+                topk_length,
+                TOPK,
+                nsplit,
+                chunk,
+                NHB,
+                BH,
+                BK,
+                HAVE_TOPK_LENGTH,
+            )
+            has_next = k + 1 < n_my
+            n_row = indices + n_tok * stride_tm + n_lo
+            n_a0 = _load_ids(n_row, 0, tl.where(has_next, n_ln, 0), BK)
+            a1 = _load_ids(t_row, 1, ln, BK)
+            # the Q position
+            qs = qk_reader.wait(p).slot
+            q0 = tl.load(tle.gpu.local_ptr(_rows(qs.k0, BH, BK)))
+            q1 = tl.load(tle.gpu.local_ptr(_rows(qs.k1, BH, BK)))
+            if TD > 0:
+                # the Q tail stays in shared memory (held in registers it costs the
+                # dots their loads in flight)
+                tl.store(
+                    tle.gpu.local_ptr(sQT),
+                    tl.load(tle.gpu.local_ptr(_rows(qs.kt, BH, BK))),
+                )
+            if nblk > 1:
+                _write_kv(writer, kv, a1, SKV, p + 2, stride_kvn, BK, BD, TD, KV_I64)
+            elif has_next:
+                _write_q(
+                    writer,
+                    q,
+                    n_tok,
+                    n_h0,
+                    p + 2,
+                    stride_qm,
+                    stride_qh,
+                    BH,
+                    BK,
+                    BD,
+                    TD,
+                )
+            p += 1
+            cur = a0
+            nx1 = a1
+            nx2 = _load_ids(t_row, 2, ln, BK)
+            for g in range(nblk):
+                ks = qk_reader.wait(p).slot
+                s = _scores_slot(q0, q1, sQT, cur, ks, sm_scale_log2, SKV, TD)
+                if NS == 1:
+                    if r >= 1:
+                        _wait_barrier(sfree)  # the PV group read S(r - 1)
+                tl.store(tle.gpu.local_ptr(sS.slot(r % NS)), s)
+                _arrive_one_of_two(ready, r % 2)
+                r += 1
+                d = g + 2
+                if d < nblk:
+                    _write_kv(
+                        writer, kv, nx2, SKV, p + 2, stride_kvn, BK, BD, TD, KV_I64
+                    )
+                elif has_next:
+                    if d == nblk:
+                        _write_q(
+                            writer,
+                            q,
+                            n_tok,
+                            n_h0,
+                            p + 2,
+                            stride_qm,
+                            stride_qh,
+                            BH,
+                            BK,
+                            BD,
+                            TD,
+                        )
+                    else:
+                        _write_kv(
+                            writer,
+                            kv,
+                            n_a0,
+                            SKV,
+                            p + 2,
+                            stride_kvn,
+                            BK,
+                            BD,
+                            TD,
+                            KV_I64,
+                        )
+                p += 1
+                cur = nx1
+                nx1 = nx2
+                nx2 = _load_ids(t_row, g + 3, ln, BK)
+            tok, h0, lo, ln, nblk = n_tok, n_h0, n_lo, n_ln, n_nblk
+            t_row = n_row
+            a0 = n_a0
+
+    @triton.jit
+    def _pv_dot_slot(pb, kslot, col0: tl.constexpr, acc, BD: tl.constexpr):
+        """acc + P @ V[:, col0:col0 + BD // 2] of a KV pipe slot field."""
+        v = tl.load(tle.gpu.local_ptr(kslot.subslice(col0, BD // 2, 1)))
+        return tl.dot(pb, v, acc)
+
+    @triton.jit
+    def _pv_group_pipe(
+        pv_reader,
+        sS,
+        ready,
+        sfree,
+        topk_length,
+        output,
+        max_logits,
+        lse,
+        attn_sink,
+        o_part,
+        ml_part,
+        pid,
+        grid,
+        n_my,
+        TOPK,
+        nsplit,
+        chunk,
+        stride_om,
+        stride_oh,
+        stride_mm,
+        stride_lm,
+        NHB: tl.constexpr,
+        HAVE_TOPK_LENGTH: tl.constexpr,
+        HAVE_ATTN_SINK: tl.constexpr,
+        PARTIAL: tl.constexpr,
+        HQ: tl.constexpr,
+        BH: tl.constexpr,
+        BK: tl.constexpr,
+        BD: tl.constexpr,
+        NS: tl.constexpr,
+        M_FLOOR: tl.constexpr,
+        RESCALE_THR: tl.constexpr,
+    ):
+        """_pv_group with the KV ring as a pipe: the V of position pos + j is read from the
+        slot that wait(pos + j) returns and released after the last dot."""
+        LN2: tl.constexpr = 0.6931471805599453
+        HB: tl.constexpr = BD // 2
+        offs_h = tl.arange(0, BH)
+        r = 0
+        pos = 0
+        for k in range(n_my):
+            tok, h0, split, lo, ln, nblk = _item(
+                k,
+                pid,
+                grid,
+                n_my,
+                topk_length,
+                TOPK,
+                nsplit,
+                chunk,
+                NHB,
+                BH,
+                BK,
+                HAVE_TOPK_LENGTH,
+            )
+            # the Q position is read by the QK group only: skip it
+            pv_reader.wait(pos)
+            pv_reader.release(pos)
+            pos += 1
+            m_i = tl.full([BH], M_FLOOR, dtype=tl.float32)  # reference max of P
+            # true max (max_logits) per row and key residue mod 4, reduced per item
+            m_max = tl.full([BH, 4], M_FLOOR, dtype=tl.float32)
+            l_i = tl.zeros([BH], dtype=tl.float32)
+            # O (BH x 512) as four BH x 128 accumulators: smaller dot tiles
+            acc0 = tl.zeros([BH, HB], dtype=tl.float32)
+            acc1 = tl.zeros([BH, HB], dtype=tl.float32)
+            acc2 = tl.zeros([BH, HB], dtype=tl.float32)
+            acc3 = tl.zeros([BH, HB], dtype=tl.float32)
+            for j in range(nblk):
+                rr = r + j
+                _wait_one_of_two(ready, rr % 2)
+                s = tl.load(tle.gpu.local_ptr(sS.slot(rr % NS)))
+                if NS == 1:
+                    if (k + 1 < n_my) | (j + 1 < nblk):
+                        tle.gpu.barrier_arrive(sfree[0])
+                # lazy rescaling: see _pv_group
+                if NS == 1:
+                    m_blk = tl.max(s, axis=1)
+                    m_max = tl.maximum(m_max, m_blk[:, None])
+                    rescale = tl.max(m_blk - m_i) > RESCALE_THR
+                else:
+                    m_max = tl.maximum(
+                        m_max, tl.max(tl.reshape(s, [BH, BK // 4, 4]), axis=1)
+                    )
+                    rescale = tl.max(s - m_i[:, None]) > RESCALE_THR
+                if rescale:
+                    if NS != 1:
+                        m_blk = tl.max(s, axis=1)
+                    m_new = tl.maximum(m_i, m_blk)
+                    alpha = tl.math.exp2(m_i - m_new)
+                    l_i = l_i * alpha
+                    acc0 = acc0 * alpha[:, None]
+                    acc1 = acc1 * alpha[:, None]
+                    acc2 = acc2 * alpha[:, None]
+                    acc3 = acc3 * alpha[:, None]
+                    m_i = m_new
+                p = tl.math.exp2(s - m_i[:, None])
+                l_i = l_i + tl.sum(p, axis=1)
+                pb = p.to(tl.bfloat16)
+                vs = pv_reader.wait(pos + j).slot
+                acc0 = _pv_dot_slot(pb, vs.k0, 0, acc0, BD)
+                acc1 = _pv_dot_slot(pb, vs.k0, HB, acc1, BD)
+                acc2 = _pv_dot_slot(pb, vs.k1, 0, acc2, BD)
+                acc3 = _pv_dot_slot(pb, vs.k1, HB, acc3, BD)
+                pv_reader.release(pos + j)
+            pos += nblk
+            r += nblk
+            m_max = tl.max(m_max, axis=1)
+            row_valid = l_i > 0
+            inv_l = tl.where(row_valid, 1.0 / l_i, 0.0)
+            if PARTIAL:
+                prow = (tok * nsplit + split) * HQ + h0 + offs_h
+                tl.store(ml_part + prow * 2, m_max)
+                tl.store(ml_part + prow * 2 + 1, l_i * tl.math.exp2(m_i - m_max))
+                op_ptr = o_part + prow[:, None] * (2 * BD)
+                _store_partial(op_ptr, 0, acc0, inv_l, BD)
+                _store_partial(op_ptr, HB, acc1, inv_l, BD)
+                _store_partial(op_ptr, BD, acc2, inv_l, BD)
+                _store_partial(op_ptr, BD + HB, acc3, inv_l, BD)
+            else:
+                lse_i = (m_i + tl.math.log2(l_i)) * LN2
+                factor = inv_l
+                if HAVE_ATTN_SINK:
+                    sink = tl.load(attn_sink + h0 + offs_h)
+                    factor = tl.where(
+                        row_valid, factor / (1.0 + tl.math.exp(sink - lse_i)), 0.0
+                    )
+                tl.store(
+                    max_logits + tok * stride_mm + h0 + offs_h,
+                    tl.where(row_valid, m_max * LN2, float("-inf")),
+                )
+                tl.store(
+                    lse + tok * stride_lm + h0 + offs_h,
+                    tl.where(row_valid, lse_i, float("inf")),
+                )
+                o_ptr = output + tok * stride_om + (h0 + offs_h)[:, None] * stride_oh
+                _store_o(o_ptr, 0, acc0, factor, BD, NS == 1)
+                _store_o(o_ptr, HB, acc1, factor, BD, NS == 1)
+                _store_o(o_ptr, BD, acc2, factor, BD, NS == 1)
+                _store_o(o_ptr, BD + HB, acc3, factor, BD, NS == 1)
+
+    @triton.jit
+    def _ppu_sparse_mla_kernel_pipe(
+        q,
+        kv,
+        indices,
+        attn_sink,
+        topk_length,
+        sm_scale_log2,
+        output,
+        max_logits,
+        lse,
+        o_part,
+        ml_part,
+        stride_qm,
+        stride_qh,
+        stride_kvn,
+        stride_tm,
+        stride_om,
+        stride_oh,
+        stride_mm,
+        stride_lm,
+        SKV,
+        TOPK,
+        n_items,
+        nsplit,
+        chunk,
+        HQ: tl.constexpr,
+        DQK: tl.constexpr,
+        HAVE_ATTN_SINK: tl.constexpr,
+        HAVE_TOPK_LENGTH: tl.constexpr,
+        PARTIAL: tl.constexpr,
+        BK: tl.constexpr,
+        M_FLOOR: tl.constexpr,
+        RESCALE_THR: tl.constexpr,
+        QK_WARPS: tl.constexpr,
+        PV_WARPS: tl.constexpr,
+        KV_I64: tl.constexpr,
+        BH: tl.constexpr,
+    ):
+        """_ppu_sparse_mla_kernel with the KV ring as a tle.pipe (see _qk_group_pipe)."""
+        BD: tl.constexpr = 256
+        NKV: tl.constexpr = 3  # KV ring
+        TD: tl.constexpr = DQK - 2 * BD
+        NS: tl.constexpr = 1 if TD > 0 else 2
+        TDA: tl.constexpr = TD if TD > 0 else 16  # placeholders without a tail
+        NHB: tl.constexpr = HQ // BH
+        pid = tl.program_id(0)
+        grid = tl.num_programs(0)
+        n_my = tl.cdiv(n_items - pid, grid)
+        sK0 = tle.gpu.alloc(
+            [NKV, BK, BD],
+            dtype=tl.bfloat16,
+            layout=_ring_layout(8, 16),
+            scope=tle.gpu.smem,
+        )
+        sK1 = tle.gpu.alloc(
+            [NKV, BK, BD],
+            dtype=tl.bfloat16,
+            layout=_ring_layout(8, 16),
+            scope=tle.gpu.smem,
+        )
+        sKT = tle.gpu.alloc(
+            [NKV, BK, TDA],
+            dtype=tl.bfloat16,
+            layout=_ring_layout(8, 8),
+            scope=tle.gpu.smem,
+        )
+        sS = tle.gpu.alloc(
+            [NS, BH, BK],
+            dtype=tl.float32,
+            layout=_ring_layout(4, 8),
+            scope=tle.gpu.smem,
+        )
+        sQT = tle.gpu.alloc(
+            [BH, TDA],
+            dtype=tl.bfloat16,
+            layout=_tile_layout(8, 8),
+            scope=tle.gpu.smem,
+        )
+        if TD > 0:
+            kv_pipe = tle.pipe(
+                capacity=NKV,
+                name="kv",
+                readers=("qk", "pv"),
+                k0=sK0,
+                k1=sK1,
+                kt=sKT,
+            )
+        else:
+            kv_pipe = tle.pipe(
+                capacity=NKV, name="kv", readers=("qk", "pv"), k0=sK0, k1=sK1
+            )
+        NTHR: tl.constexpr = (QK_WARPS + PV_WARPS) * 32
+        ready = tle.gpu.alloc_barriers(2, arrive_count=NTHR)
+        sfree = tle.gpu.alloc_barriers(1, arrive_count=NTHR)
+        tle.gpu.warp_specialize(
+            [
+                (
+                    _qk_group_pipe,
+                    (
+                        q,
+                        kv,
+                        indices,
+                        topk_length,
+                        kv_pipe.writer(),
+                        kv_pipe.reader("qk"),
+                        sQT,
+                        sS,
+                        ready,
+                        sfree,
+                        pid,
+                        grid,
+                        n_my,
+                        TOPK,
+                        nsplit,
+                        chunk,
+                        SKV,
+                        sm_scale_log2,
+                        stride_qm,
+                        stride_qh,
+                        stride_kvn,
+                        stride_tm,
+                        NHB,
+                        HAVE_TOPK_LENGTH,
+                        BH,
+                        BK,
+                        BD,
+                        TD,
+                        NS,
+                        KV_I64,
+                    ),
+                ),
+                (
+                    _pv_group_pipe,
+                    (
+                        kv_pipe.reader("pv"),
+                        sS,
+                        ready,
+                        sfree,
+                        topk_length,
+                        output,
+                        max_logits,
+                        lse,
+                        attn_sink,
+                        o_part,
+                        ml_part,
+                        pid,
+                        grid,
+                        n_my,
+                        TOPK,
+                        nsplit,
+                        chunk,
+                        stride_om,
+                        stride_oh,
+                        stride_mm,
+                        stride_lm,
+                        NHB,
+                        HAVE_TOPK_LENGTH,
+                        HAVE_ATTN_SINK,
+                        PARTIAL,
+                        HQ,
+                        BH,
+                        BK,
+                        BD,
+                        NS,
+                        M_FLOOR,
+                        RESCALE_THR,
+                    ),
+                ),
+            ],
+            [PV_WARPS],
+            [256],  # requested registers of the PV group; PPU ignores them
+        )
+
     @triton.jit
     def _ppu_sparse_mla_kernel(
         q,
@@ -1126,6 +1709,19 @@ def _has_tle() -> bool:
 
 
 @functools.lru_cache(maxsize=None)
+def _has_tle_pipe() -> bool:
+    return _tle_api is not None and _tle_api.is_tle_supported(_TLE_PIPE_PRIMITIVES)
+
+
+def _use_pipe() -> bool:
+    """The tle.pipe variant of the kernel, selected with FLAGGEMS_FLASHMLA_SPARSE_PIPE=1.
+    The default keeps the KV ring on cp.async inline assembly, which leaves two gathers
+    in flight."""
+    value = os.environ.get("FLAGGEMS_FLASHMLA_SPARSE_PIPE", "0").lower()
+    return value in {"1", "true", "on", "yes"} and _has_tle_pipe()
+
+
+@functools.lru_cache(maxsize=None)
 def _mma_sm_count(device_index: int) -> int:
     props = torch_device_fn.get_device_properties(device_index)
     return _MMA_SM_COUNT.get(props.name, props.multi_processor_count)
@@ -1223,7 +1819,8 @@ def flash_mla_sparse_fwd(
     with torch_device_fn.device(q.device):
         n_items = SQ * nsplit * (HQ // bh)
         # warp_specialize cannot capture None: unused pointers get a placeholder
-        _ppu_sparse_mla_kernel[(min(n_items, n_sm),)](
+        kernel = _ppu_sparse_mla_kernel_pipe if _use_pipe() else _ppu_sparse_mla_kernel
+        kernel[(min(n_items, n_sm),)](
             q,
             kv,
             indices,
