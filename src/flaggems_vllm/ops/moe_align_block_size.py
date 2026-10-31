@@ -21,6 +21,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.utils import has_triton_tle, libentry, libtuner
+from flaggems_vllm.utils.tle_dispatch import use_tle
 
 if has_triton_tle(3, 6, 0):
     try:
@@ -606,7 +607,14 @@ def moe_align_block_size_triton(
     numel_expert_ids = expert_ids.numel()
     block_expert_tle = triton.next_power_of_2(num_experts)
 
-    if HAS_TLE and topk_ids.is_cuda and block_expert_tle <= 1024:
+    if use_tle(
+        "moe_align_block_size",
+        available=HAS_TLE,
+        primitives=("device_mesh", "distributed_barrier"),
+        supported=topk_ids.is_cuda and block_expert_tle <= 1024,
+        tokens=topk_ids.shape[0],
+        experts=num_experts,
+    ):
         block_tokens_taf, _ = _pick_tle_atomic_fused_launch_params(numel, num_experts)
         experts_per_shard = ceil_div(num_experts, TLE_CLUSTER_SIZE)
         num_tokens = topk_ids.shape[0] if topk_ids.ndim > 1 else numel

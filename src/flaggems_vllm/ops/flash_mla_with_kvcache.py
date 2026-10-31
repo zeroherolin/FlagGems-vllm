@@ -19,14 +19,13 @@ Only supports sm90 (Hopper) architecture.
 """
 
 import dataclasses
-import os
 from typing import Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
-from flaggems_vllm.utils.tle_capabilities import vendor_takes_tle_pipe_kernels
+from flaggems_vllm.utils.tle_dispatch import use_tle
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 if has_triton_tle(3, 6, 0):
@@ -1385,11 +1384,6 @@ def _dense_decode_dispatch(
 # ============================================================================
 
 
-def _tle_decode_enabled() -> bool:
-    value = os.environ.get("FLAGGEMS_FLASHMLA_DECODE_TLE", "1").lower()
-    return value not in {"0", "false", "off", "no"}
-
-
 def _can_use_tle_sparse_decode(
     q: torch.Tensor,
     indices: torch.Tensor,
@@ -1397,18 +1391,23 @@ def _can_use_tle_sparse_decode(
     head_dim_k: int,
     is_fp8: bool,
 ) -> bool:
-    if not (HAS_TLE and _tle_decode_enabled()):
-        return False
-    if q.device.type != "cuda":
-        return False
-    batch_size, seq_q, num_heads_q, d_qk = q.shape
-    TOPK = indices.shape[-1]
-    return (
-        head_dim_v == 512
-        and d_qk in (512, 576)
-        and num_heads_q % TLE_DECODE_BH == 0
-        and TOPK > 0
-        and TOPK % (TLE_DECODE_BK * TLE_DECODE_PAIR_BLOCKS) == 0
+    supported = q.device.type == "cuda"
+    if supported:
+        batch_size, seq_q, num_heads_q, d_qk = q.shape
+        TOPK = indices.shape[-1]
+        supported = (
+            head_dim_v == 512
+            and d_qk in (512, 576)
+            and num_heads_q % TLE_DECODE_BH == 0
+            and TOPK > 0
+            and TOPK % (TLE_DECODE_BK * TLE_DECODE_PAIR_BLOCKS) == 0
+        )
+    return use_tle(
+        "flashmla_decode",
+        available=HAS_TLE,
+        supported=supported,
+        legacy_env="FLAGGEMS_FLASHMLA_DECODE_TLE",
+        legacy_force=True,
     )
 
 
@@ -1419,16 +1418,21 @@ def _can_use_tle_dense_decode(
     head_dim_v: int,
     page_block_size: int,
 ) -> bool:
-    if not (HAS_TLE and _tle_decode_enabled() and vendor_takes_tle_pipe_kernels()):
-        return False
-    if q.device.type != "cuda":
-        return False
-    batch_size, seq_q, num_heads_q, d_qk = q.shape
-    return (
-        head_dim_v == 512
-        and d_qk in (512, 576)
-        and num_heads_q % TLE_DECODE_BH == 0
-        and page_block_size == TLE_DECODE_BK
+    supported = q.device.type == "cuda"
+    if supported:
+        batch_size, seq_q, num_heads_q, d_qk = q.shape
+        supported = (
+            head_dim_v == 512
+            and d_qk in (512, 576)
+            and num_heads_q % TLE_DECODE_BH == 0
+            and page_block_size == TLE_DECODE_BK
+        )
+    return use_tle(
+        "flashmla_decode",
+        available=HAS_TLE,
+        supported=supported,
+        legacy_env="FLAGGEMS_FLASHMLA_DECODE_TLE",
+        legacy_force=True,
     )
 
 

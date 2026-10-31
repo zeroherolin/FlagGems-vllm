@@ -142,3 +142,7 @@ except ImportError:
 - [后端开发指南](../contribution/backend.md)
 - [单元测试指南](../testing/unittest.md)
 - [性能基准测试](../performance/benchmark.md)
+
+### PPU TLE 路径选择
+
+PPU 的实现选择、覆盖开关和兼容规则见 [PPU TLE 实现选择](ppu-tle.md)。正常运行无需设置覆盖变量。

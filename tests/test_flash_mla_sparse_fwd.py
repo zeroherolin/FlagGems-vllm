@@ -32,9 +32,7 @@ random.seed(42)
 def kv_ring_path(request, monkeypatch):
     """Cover both the inline-assembly and tle.pipe KV rings on PPU."""
     if request.param is not None:
-        monkeypatch.setenv(
-            "FLAGGEMS_FLASHMLA_SPARSE_PIPE", "1" if request.param == "pipe" else "0"
-        )
+        monkeypatch.setenv("FLAGGEMS_FLASHMLA_SPARSE_RING", request.param)
 
 
 def _get_vllm_flashmla_sparse_reference():

@@ -193,3 +193,7 @@ See the [backend development guide](../contribution/backend.md) for details.
 - [Backend development guide](../contribution/backend.md)
 - [Testing guide](../testing/unittest.md)
 - [Performance benchmarking](../performance/benchmark.md)
+
+### PPU TLE implementation selection
+
+See [PPU TLE implementation selection](ppu-tle.md) for automatic defaults, per-operator overrides and legacy compatibility. Normal execution requires no override variables.

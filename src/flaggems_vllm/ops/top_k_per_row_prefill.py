@@ -20,7 +20,6 @@ https://github.com/flagos-ai/FlagTree.git, align with vLLM implementation.
 """
 
 import logging
-import os
 
 import torch
 import triton
@@ -29,6 +28,7 @@ import triton.language as tl
 from flaggems_vllm import runtime
 from flaggems_vllm.utils import libentry, libtuner
 from flaggems_vllm.utils.tle_capabilities import supports_topk_tle
+from flaggems_vllm.utils.tle_dispatch import use_tle
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 _LAUNCH_GEOMETRY = None
@@ -60,21 +60,14 @@ def _num_warps(block_size):
 
 
 def _vendor_tle_enabled() -> bool:
-    """Whether the backend declares TLE support in its VendorDescriptor.
-
-    `has_triton_tle()` only proves the module imports, not that the backend can
-    lower `tle.gpu.alloc`. FLAGGEMS_FORCE_TLE overrides.
-    """
-    override = os.environ.get("FLAGGEMS_FORCE_TLE")
-    if override is not None:
-        return override.lower() not in {"0", "false", "off", "no"}
+    """The vendor default; environment overrides are resolved at the call site."""
     try:
         return bool(getattr(runtime.device.info, "tle_enabled", False))
     except Exception:  # noqa: BLE001 - never let detection break the import
         return False
 
 
-if has_triton_tle(3, 6, 0) and _vendor_tle_enabled():
+if has_triton_tle(3, 6, 0):
     try:
         import triton.experimental.tle.language as tle
 
@@ -1436,7 +1429,12 @@ def top_k_per_row_prefill(
 
     vocab_size = logits.shape[1]
     assert num_rows == logits.shape[0]
-    if HAS_TLE:
+    if use_tle(
+        "top_k_per_row_prefill",
+        available=HAS_TLE,
+        default=_vendor_tle_enabled(),
+        legacy_force=True,
+    ):
         topkp = triton.next_power_of_2(top_k)
         use_radix_final = _use_radix_final_for_prefill(vocab_size)
         num_insert_sort_blocks = (

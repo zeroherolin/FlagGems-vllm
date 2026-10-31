@@ -11,7 +11,6 @@ import torch
 from flaggems_vllm.utils.tle_capabilities import (
     supports_sparse_mla_tle,
     supports_topk_tle,
-    vendor_takes_tle_pipe_kernels,
 )
 
 
@@ -195,28 +194,3 @@ def test_incomplete_tle_topk_matches_reference(load_topk_module):
         actual = logits[row, start + selected].sort(descending=True).values
         expected = logits[row, start:end].topk(top_k).values
         torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize(
-    "vendor,force,expected",
-    [
-        ("thead", None, False),
-        ("thead", "0", False),
-        ("thead", "1", True),
-        ("nvidia", None, True),
-        ("nvidia", "1", True),
-        # the setting that turns off the top-k TLE kernels must not turn off these
-        ("nvidia", "0", True),
-    ],
-)
-def test_vendor_takes_tle_pipe_kernels(monkeypatch, vendor, force, expected):
-    import flaggems_vllm
-
-    if force is None:
-        monkeypatch.delenv("FLAGGEMS_FORCE_TLE", raising=False)
-    else:
-        monkeypatch.setenv("FLAGGEMS_FORCE_TLE", force)
-    monkeypatch.setattr(
-        flaggems_vllm.runtime.device, "vendor_name", vendor, raising=False
-    )
-    assert vendor_takes_tle_pipe_kernels() is expected

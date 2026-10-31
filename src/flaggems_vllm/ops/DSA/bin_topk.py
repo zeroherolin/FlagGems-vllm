@@ -16,6 +16,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.utils.tle_dispatch import get_tle_backend, use_tle
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 if has_triton_tle(3, 6, 0):
@@ -1110,18 +1111,25 @@ def tle_bucket_sort_topk(
 
 
 def _should_use_tle_bucket_sort_topk(inputs, topk):
-    if not HAS_TLE:
-        return False
-    if not isinstance(inputs, torch.Tensor) or inputs.device.type != "cuda":
-        return False
-    return True
+    return use_tle(
+        "bucket_sort_topk",
+        available=HAS_TLE,
+        supported=isinstance(inputs, torch.Tensor) and inputs.device.type == "cuda",
+    )
 
 
 def bucket_sort_topk(inputs, starts, ends, topk):
     if _should_use_tle_bucket_sort_topk(inputs, topk):
+        from flaggems_vllm import runtime
+
+        if (
+            runtime.device.vendor_name == "thead"
+            or get_tle_backend("bucket_sort_topk") == "tle"
+        ):
+            return tle_bucket_sort_topk(inputs, starts, ends, topk)
         try:
             return tle_bucket_sort_topk(inputs, starts, ends, topk)
         except Exception:
-            # Fallback to legacy implementation when TLE path is unsupported at runtime.
+            # Preserve other backends' existing automatic fallback.
             return bucket_sort_topk_triton(inputs, starts, ends, topk)
     return bucket_sort_topk_triton(inputs, starts, ends, topk)

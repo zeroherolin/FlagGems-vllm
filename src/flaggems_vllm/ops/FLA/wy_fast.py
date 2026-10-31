@@ -5,7 +5,6 @@
 
 # ruff: noqa: E501
 
-import os
 
 import torch
 import triton
@@ -13,7 +12,7 @@ import triton.language as tl
 
 from flaggems_vllm.ops.FLA.index import prepare_chunk_indices
 from flaggems_vllm.utils import libentry, libtuner
-from flaggems_vllm.utils.tle_capabilities import vendor_takes_tle_pipe_kernels
+from flaggems_vllm.utils.tle_dispatch import use_tle
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle_attrs
 
 if has_triton_tle_attrs(("load",), 3, 6, 0):
@@ -30,12 +29,12 @@ else:
 
 
 def _use_tle_recompute_w_u(cu_seqlens: torch.Tensor | None) -> bool:
-    value = os.environ.get("FLAGGEMS_CHUNK_GDR_RECOMPUTE_TLE", "1").lower()
-    return (
-        HAS_TLE_RECOMPUTE_W_U
-        and cu_seqlens is None
-        and value not in {"0", "false", "off", "no"}
-        and vendor_takes_tle_pipe_kernels()
+    return use_tle(
+        "chunk_gdr_recompute",
+        available=HAS_TLE_RECOMPUTE_W_U,
+        supported=cu_seqlens is None,
+        legacy_env="FLAGGEMS_CHUNK_GDR_RECOMPUTE_TLE",
+        legacy_force=True,
     )
 
 

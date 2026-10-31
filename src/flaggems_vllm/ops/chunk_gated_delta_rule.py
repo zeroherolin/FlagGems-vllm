@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 
 import torch
 import triton
@@ -27,7 +26,7 @@ from flaggems_vllm.ops.FLA.fused_cumsum_kkt_solve_tril import (
     chunk_gated_delta_rule_fused_cumsum_kkt_solve_tril,
 )
 from flaggems_vllm.utils import libentry
-from flaggems_vllm.utils.tle_capabilities import vendor_takes_tle_pipe_kernels
+from flaggems_vllm.utils.tle_dispatch import use_tle
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle_attrs
 
 if has_triton_tle_attrs(
@@ -89,11 +88,6 @@ def _l2_normalize_last_dim_kernel(
     tl.store(out + row * K + offs, values * inv_norm, mask=mask)
 
 
-def _tle_chunk_gdr_enabled() -> bool:
-    value = os.environ.get("FLAGGEMS_CHUNK_GATED_DELTA_RULE_TLE", "1").lower()
-    return value not in {"0", "false", "off", "no"}
-
-
 def _tle_chunk_gdr_target_num_ctas(device: torch.device) -> int:
     try:
         props = torch.cuda.get_device_properties(device)
@@ -145,41 +139,37 @@ def _can_use_tle_chunk_gated_delta_rule(
     output_final_state: bool,
     cu_seqlens: torch.Tensor | None,
 ) -> bool:
-    if not (
-        HAS_TLE_CHUNK_GATED_DELTA_RULE
-        and _tle_chunk_gdr_enabled()
-        and vendor_takes_tle_pipe_kernels()
-    ):
-        return False
-    if not output_final_state:
-        return False
-    if initial_state is not None or cu_seqlens is not None:
-        return False
-    if q.device.type != "cuda":
-        return False
-    if not all(x.device == q.device for x in (k, v, beta, g)):
-        return False
-    if q.dtype not in (torch.float16, torch.bfloat16):
-        return False
-    if not all(x.dtype == q.dtype for x in (k, v, beta, g)):
-        return False
-    if q.ndim != 4 or k.ndim != 4 or v.ndim != 4:
-        return False
-    if beta.ndim != 3 or g.ndim != 3:
-        return False
-
-    B, T, Hg, K = q.shape
-    H = v.shape[2]
-    return (
-        k.shape == (B, T, Hg, K)
-        and v.shape[:2] == (B, T)
-        and beta.shape == (B, T, H)
-        and g.shape == (B, T, H)
-        and H % Hg == 0
-        and K == TLE_CHUNK_GDR_HEAD_DIM
-        and v.shape[3] == TLE_CHUNK_GDR_HEAD_DIM
-        and T > 0
-        and T % TLE_CHUNK_GDR_BLOCK_S == 0
+    supported = (
+        output_final_state
+        and initial_state is None
+        and cu_seqlens is None
+        and q.device.type == "cuda"
+        and all(x.device == q.device for x in (k, v, beta, g))
+        and q.dtype in (torch.float16, torch.bfloat16)
+        and all(x.dtype == q.dtype for x in (k, v, beta, g))
+        and q.ndim == k.ndim == v.ndim == 4
+        and beta.ndim == g.ndim == 3
+    )
+    if supported:
+        B, T, Hg, K = q.shape
+        H = v.shape[2]
+        supported = (
+            k.shape == (B, T, Hg, K)
+            and v.shape[:2] == (B, T)
+            and beta.shape == (B, T, H)
+            and g.shape == (B, T, H)
+            and H % Hg == 0
+            and K == TLE_CHUNK_GDR_HEAD_DIM
+            and v.shape[3] == TLE_CHUNK_GDR_HEAD_DIM
+            and T > 0
+            and T % TLE_CHUNK_GDR_BLOCK_S == 0
+        )
+    return use_tle(
+        "chunk_gated_delta_rule",
+        available=HAS_TLE_CHUNK_GATED_DELTA_RULE,
+        supported=supported,
+        legacy_env="FLAGGEMS_CHUNK_GATED_DELTA_RULE_TLE",
+        legacy_force=True,
     )
 
 

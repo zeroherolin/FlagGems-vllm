@@ -20,14 +20,12 @@ Two forward paths with identical semantics share one public entry, ``chunk_kda``
 * Triton fallback (``chunk_kda_fwd_infer_triton``): portable plain-Triton
   kernels shared verbatim with ``flaggems_vllm.ops.FLA.chunk_kda``.
 
-``chunk_kda`` validates inputs first, then dispatches: TLE when
-available, and Triton otherwise. Set ``FLAGGEMS_CHUNK_KDA_BACKEND`` to
+``chunk_kda`` validates inputs first, then selects an implementation using the
+PPU performance policy. Set ``FLAGGEMS_CHUNK_KDA_BACKEND`` to
 ``tle`` or ``triton`` to force a backend; the default is ``auto``.
 """
 
 from __future__ import annotations
-
-import os
 
 import torch
 import triton
@@ -39,6 +37,7 @@ from flaggems_vllm.ops.FLA.chunk_kda import (
     chunk_kda_fwd_infer_triton,
 )
 from flaggems_vllm.ops.FLA.index import prepare_chunk_indices
+from flaggems_vllm.utils.tle_dispatch import use_tle
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 if has_triton_tle(3, 6, 0):
@@ -60,25 +59,6 @@ __all__ = ["chunk_kda"]
 # =============================================================================
 
 RCP_LN2 = 1.4426950216
-_BACKEND_ENV = "FLAGGEMS_CHUNK_KDA_BACKEND"
-_BACKEND_ALIASES = {
-    "auto": "auto",
-    "tle": "tle",
-    "generic_tle": "tle",
-    "triton": "triton",
-    "triton_fuse": "triton",
-}
-
-
-def _chunk_kda_backend() -> str:
-    value = os.environ.get(_BACKEND_ENV, "auto").strip().lower()
-    try:
-        return _BACKEND_ALIASES[value]
-    except KeyError as exc:
-        choices = ", ".join(sorted(_BACKEND_ALIASES))
-        raise ValueError(
-            f"invalid {_BACKEND_ENV}={value!r}; expected one of: {choices}"
-        ) from exc
 
 
 @triton.jit
@@ -997,11 +977,7 @@ def chunk_kda(
         lower_bound=lower_bound,
     )
 
-    backend = _chunk_kda_backend()
-    if backend == "tle" and not HAS_TLE_KDA:
-        raise RuntimeError(f"{_BACKEND_ENV}=tle requires Triton TLE >= 3.6.0")
-
-    if backend in {"auto", "tle"} and HAS_TLE_KDA:
+    if use_tle("chunk_kda", available=HAS_TLE_KDA, T=q.shape[1], D=q.shape[-1]):
         return thead_chunk_kda_fwd_infer(
             q=q,
             k=k,

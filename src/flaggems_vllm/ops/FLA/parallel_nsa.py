@@ -5,7 +5,6 @@
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
 
-import os
 import warnings
 
 import torch
@@ -23,6 +22,7 @@ from flaggems_vllm.ops.FLA.mean_pooling import mean_pooling
 from flaggems_vllm.ops.FLA.parallel_nsa_compression import parallel_nsa_compression
 from flaggems_vllm.ops.FLA.triton_ops_helper import autotune_cache_kwargs, exp, log
 from flaggems_vllm.ops.FLA.utils import _bitonic_merge, check_shared_mem, input_guard
+from flaggems_vllm.utils.tle_dispatch import use_tle
 
 try:
     HAS_TLE = False
@@ -839,7 +839,9 @@ def parallel_nsa_fwd(
     lse = torch.empty(B, T, HQ, dtype=torch.float, device=q.device)
 
     # Dispatch to TLE-optimized kernel when available.
-    _use_tle = HAS_TLE and os.environ.get("FLA_NSA_TLE", "1") != "0"
+    _use_tle = use_tle(
+        "parallel_nsa", available=HAS_TLE, legacy_env="FLA_NSA_TLE", T=T, D=K
+    )
     if _use_tle:
         kernel = parallel_nsa_fwd_kernel_tle
     else:

@@ -49,6 +49,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.utils import has_triton_tle
+from flaggems_vllm.utils.tle_dispatch import use_tle
 
 logger = logging.getLogger(__name__)
 
@@ -533,7 +534,13 @@ def topk_softplus_sqrt(
     specific variant (e.g. for benchmarking/testing).
     """
     logger.debug("GEMS TOPK_SOFTPLUS_SQRT")
-    use_tle = _topk_tle_available(gating_output)
+    selected_tle = use_tle(
+        "topk_softplus_sqrt",
+        available=_topk_tle_available(gating_output),
+        tokens=gating_output.shape[0],
+        experts=gating_output.shape[1],
+        hash_mode=tid2eid is not None,
+    )
     _topk_softplus_sqrt_impl(
         topk_weights,
         topk_indices,
@@ -544,7 +551,7 @@ def topk_softplus_sqrt(
         correction_bias,
         input_ids,
         tid2eid,
-        use_tle=use_tle,
+        use_tle=selected_tle,
     )
 
 

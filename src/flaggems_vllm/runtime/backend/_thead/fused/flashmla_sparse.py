@@ -38,6 +38,7 @@ from flaggems_vllm.ops.flashmla_sparse import (
 )
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import libentry
+from flaggems_vllm.utils.tle_dispatch import use_tle
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 if has_triton_tle():
@@ -1701,9 +1702,26 @@ def _has_tle_pipe() -> bool:
 
 
 def _use_pipe() -> bool:
-    """Select tle.pipe with FLAGGEMS_FLASHMLA_SPARSE_PIPE=1 when supported."""
-    value = os.environ.get("FLAGGEMS_FLASHMLA_SPARSE_PIPE", "0").lower()
-    return value in {"1", "true", "on", "yes"} and _has_tle_pipe()
+    """Select the KV-ring implementation independently of TLE dispatch."""
+    value = os.environ.get("FLAGGEMS_FLASHMLA_SPARSE_RING", "auto").strip().lower()
+    if value not in {"auto", "inline_asm", "pipe"}:
+        raise ValueError(
+            f"invalid FLAGGEMS_FLASHMLA_SPARSE_RING={value!r}; "
+            "expected auto, inline_asm or pipe"
+        )
+    if value == "pipe":
+        if not _has_tle_pipe():
+            raise NotImplementedError(
+                "FLAGGEMS_FLASHMLA_SPARSE_RING=pipe requires PPU TLE pipe support"
+            )
+        return True
+    if value == "inline_asm" or "FLAGGEMS_FLASHMLA_SPARSE_RING" in os.environ:
+        return False
+    return (
+        os.environ.get("FLAGGEMS_FLASHMLA_SPARSE_PIPE", "0").lower()
+        in {"1", "true", "on", "yes"}
+        and _has_tle_pipe()
+    )
 
 
 @functools.lru_cache(maxsize=None)
@@ -1745,7 +1763,11 @@ def flash_mla_sparse_fwd(
     topk_length: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Sparse attention prefill kernel; see flaggems_vllm.ops.flashmla_sparse."""
-    if not _has_tle():
+    if not use_tle(
+        "flashmla_sparse",
+        available=_has_tle(),
+        legacy_env="FLAGGEMS_FLASHMLA_SPARSE_TLE",
+    ):
         return _generic_flash_mla_sparse_fwd(
             q, kv, indices, sm_scale, d_v, attn_sink, topk_length
         )

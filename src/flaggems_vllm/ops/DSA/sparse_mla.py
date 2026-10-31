@@ -18,6 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
+from flaggems_vllm.utils.tle_dispatch import use_tle
 from flaggems_vllm.utils.triton_version_utils import HAS_TLE
 
 if HAS_TLE:
@@ -369,7 +370,7 @@ def triton_sparse_mla_fwd_interface(
         BH,
         is_causal,
     )
-    if HAS_TLE:
+    if use_tle("sparse_mla", available=HAS_TLE, T=SQ, topk=K):
         triton_sparse_mla_fwd_tle[grid](*kernel_args)
     else:
         triton_sparse_mla_fwd[grid](*kernel_args)

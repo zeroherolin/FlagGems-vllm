@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 from typing import Optional, Tuple
 
 import torch
@@ -20,6 +19,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.utils.tle_capabilities import supports_sparse_mla_tle
+from flaggems_vllm.utils.tle_dispatch import use_tle
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 if has_triton_tle(3, 6, 0):
@@ -1004,11 +1004,6 @@ if HAS_TLE_FLASHMLA_SPARSE:
         )
 
 
-def _flash_mla_sparse_tle_enabled() -> bool:
-    value = os.environ.get("FLAGGEMS_FLASHMLA_SPARSE_TLE", "1").lower()
-    return value not in {"0", "false", "off", "no"}
-
-
 def _can_use_tle_flash_mla_sparse_fwd(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -1016,21 +1011,24 @@ def _can_use_tle_flash_mla_sparse_fwd(
     d_v: int,
     topk_length: Optional[torch.Tensor] = None,
 ) -> bool:
-    if not (HAS_TLE_FLASHMLA_SPARSE and _flash_mla_sparse_tle_enabled()):
-        return False
-    if q.device.type != "cuda":
-        return False
-    SQ, HQ, DQK = q.shape
-    _ = SQ
-    HKV = kv.shape[1]
-    TOPK = indices.shape[-1]
-    return (
-        d_v == 512
-        and HKV == 1
-        and DQK in (512, 576)
-        and HQ % TLE_FLASHMLA_PREFILL_BH == 0
-        and TOPK > 0
-        and TOPK % 128 == 0
+    supported = q.device.type == "cuda"
+    if supported:
+        SQ, HQ, DQK = q.shape
+        HKV = kv.shape[1]
+        TOPK = indices.shape[-1]
+        supported = (
+            d_v == 512
+            and HKV == 1
+            and DQK in (512, 576)
+            and HQ % TLE_FLASHMLA_PREFILL_BH == 0
+            and TOPK > 0
+            and TOPK % 128 == 0
+        )
+    return use_tle(
+        "flashmla_sparse",
+        available=HAS_TLE_FLASHMLA_SPARSE,
+        supported=supported,
+        legacy_env="FLAGGEMS_FLASHMLA_SPARSE_TLE",
     )
 
 

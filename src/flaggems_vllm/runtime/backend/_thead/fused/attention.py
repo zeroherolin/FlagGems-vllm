@@ -18,6 +18,7 @@ import triton.language as tl
 
 from flaggems_vllm.runtime import torch_device_fn
 from flaggems_vllm.utils import has_triton_tle_attrs, libentry
+from flaggems_vllm.utils.tle_dispatch import use_tle
 
 if has_triton_tle_attrs(("load",), 3, 6, 0):
     try:
@@ -613,7 +614,13 @@ def flash_attn_varlen_func_w8a8_int8(
         and max_seqlen_k > 0
         and batch * max_seqlen_k <= k.shape[0] * k.shape[1]
     )
-    use_aiu_k = logical_kv and HAS_AIU_K
+    use_aiu_k = use_tle(
+        "flash_attn_varlen_int8",
+        available=HAS_AIU_K,
+        supported=logical_kv,
+        T=max_seqlen_q,
+        S=max_seqlen_k,
+    )
     reorder_causal = use_aiu_k and causal and left < 0 and right < 0
     block_m = 64 if not paged and not causal and max_seqlen_q >= 512 else 16
     fold = paged and group > 1 and group <= 16 and group & (group - 1) == 0

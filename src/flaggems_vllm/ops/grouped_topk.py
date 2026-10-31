@@ -19,6 +19,7 @@ import triton
 import triton.language as tl
 
 from flaggems_vllm.utils import tl_extra_shim
+from flaggems_vllm.utils.tle_dispatch import use_tle
 from flaggems_vllm.utils.triton_version_utils import has_triton_tle
 
 
@@ -29,7 +30,7 @@ def backend_tle_enabled():
     return vendor_info.tle_enabled
 
 
-if backend_tle_enabled() & has_triton_tle(3, 6, 0):
+if has_triton_tle(3, 6, 0):
     try:
         import triton.experimental.tle.language as tle
 
@@ -589,7 +590,7 @@ def grouped_topk(
     else:
         raise ValueError(f"Unsupported dtype: {scores.dtype}")
 
-    if (
+    supported_tle = (
         (n_group > 1)
         & (n_group <= 32)
         & (num_experts <= 256)
@@ -597,7 +598,14 @@ def grouped_topk(
         & (num_experts_per_group * topk_group <= 128)
         & (topk <= 8)
         & (topk_group <= 4)
-    ):
+    )
+    selected_tle = use_tle(
+        "grouped_topk",
+        available=HAS_TLE,
+        supported=supported_tle,
+        default=backend_tle_enabled(),
+    )
+    if supported_tle:
         # DeepSeek-v3.2
         topk_values = torch.empty(
             (num_tokens, topk),
@@ -609,7 +617,7 @@ def grouped_topk(
             device=scores.device,
             dtype=torch.int32,
         )
-        if not HAS_TLE:
+        if not selected_tle:
             g_scores_sigmoid = torch.empty(
                 (num_tokens, num_experts),
                 device=scores.device,
@@ -642,7 +650,7 @@ def grouped_topk(
             g_scores_sigmoid,
             g_scores_bias,
             SCORING_FUNC=scoring_func,
-            HAS_TLE=HAS_TLE,
+            HAS_TLE=selected_tle,
             NUM_GROUPS_PAD=n_group_pad,
             FULL_SHAPE=num_experts_per_group == 32 and n_group == n_group_pad,
             num_warps=1,

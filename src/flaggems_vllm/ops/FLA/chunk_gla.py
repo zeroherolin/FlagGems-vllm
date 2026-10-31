@@ -4,11 +4,12 @@
 # LICENSE file in the root directory of this source tree.
 # For a list of all contributors, visit:
 #   https://github.com/fla-org/flash-linear-attention/graphs/contributors
-import os
 
 import torch
 import triton
 import triton.language as tl
+
+from flaggems_vllm.utils.tle_dispatch import use_tle
 
 try:
     HAS_TLE = False
@@ -1436,7 +1437,9 @@ def chunk_gla_fwd_o_gk(
     def grid_tle(meta):
         return (triton.cdiv(V, meta["BV"] * meta.get("B_VCHUNK", 1)), NT, B * HV)
 
-    _use_tle = HAS_TLE and os.environ.get("FLA_GLA_TLE", "1") != "0"
+    _use_tle = use_tle(
+        "chunk_gla", available=HAS_TLE, legacy_env="FLA_GLA_TLE", T=T, D=K
+    )
     if _use_tle:
         kernel = chunk_gla_fwd_kernel_o_tle
         grid_fn = grid_tle
