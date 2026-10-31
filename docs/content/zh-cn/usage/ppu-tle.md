@@ -9,10 +9,10 @@ PPU 算子的默认实现由 `runtime/backend/_thead/tle_config.py` 集中选择
 ```bash
 FLAGGEMS_<OP>_BACKEND=auto   # 默认：使用后端的性能策略
 FLAGGEMS_<OP>_BACKEND=triton # 普通 Triton 实现
-FLAGGEMS_<OP>_BACKEND=tle    # TLE 实现，编译器或输入不支持时明确报错
+FLAGGEMS_<OP>_BACKEND=tle    # TLE 实现；候选不可用时明确报错
 ```
 
-选择发生在 host dispatch；不会捕获 PPU kernel 执行错误并静默切换实现。无效设置会报 `ValueError`。`auto` 仅在能力和输入条件满足时采用 TLE，否则使用普通 Triton。
+原有输入合法性检查仍然生效；显式请求的 TLE 候选不可用时报告 `NotImplementedError`。选择发生在 host dispatch；不会捕获 PPU kernel 执行错误并静默切换实现。无效设置会报 `ValueError`。`auto` 仅在能力和输入条件满足时采用 TLE，否则使用普通 Triton。
 
 | OP | 旧变量（兼容） |
 | --- | --- |
@@ -43,7 +43,7 @@ FLAGGEMS_FLASHMLA_SPARSE_RING=pipe
 
 `pipe` 需要编译器支持对应 TLE 原语；显式选择不满足条件时报错。旧 `FLAGGEMS_FLASHMLA_SPARSE_PIPE` 保留兼容，新变量优先。两种环都属于 TLE 实现，不能用 `BACKEND` 来区分。
 
-`persistent_topk` 的 PPU 专用共享内存实现和仅有单一路径的算子不增加虚假的备选开关。`attn_res` 的异步加载属于已有 autotune 候选，由原调优器选择。FP8 WGMMA/TMA 等依赖其他架构的路径保留原硬件限制。厂商的 `tle_enabled` 和编译器原语支持表不作为全算子性能开关。
+`persistent_topk` 的 PPU 专用共享内存实现和仅有单一路径的算子不增加覆盖选项。`attn_res` 的异步加载属于已有 autotune 候选，由原调优器选择。FP8 WGMMA/TMA 等依赖其他架构的路径保留原硬件限制。厂商的 `tle_enabled` 和编译器原语支持表不作为全算子性能开关。
 
 性能策略只作用于 PPU；其他厂商的默认实现和调优配置保持各自规则。测试和基准应显式固定待比较路径及输入，记录编译器、设备和缓存条件。
 
@@ -65,6 +65,6 @@ TLE per-row TopK 的稳定性测试在原始算子库和基线编译器上也失
 
 默认策略是对已验证输入范围的性能选择，不代表对所有可能形状的全局最优证明。没有稳定收益的输入类别使用普通 Triton；跨形状存在稳定差异时按输入路由。
 
-性能对照覆盖 GLA 的 6 个形状、NSA 的 6 个形状、KDA 的 20 个 dense / varlen 输入、softplus 的 20 个 hash / 非 hash 输入，以及 grouped TopK、DSA、INT8 attention 的代表负载。使用同输入两路数值检查、空闲设备、GEMM 校准和 CUDA graph 5×40 ms 中位数计时。KDA 的 D=64 类别总体支持 TLE；其中 T=2048 的 dense 输入差异约 1%，未显示显著回归。D=128 的短序列 T=32 使用 TLE，T=64/128/256 及更长序列使用普通实现。
+性能对照共 70 组：GLA 6、NSA 6、KDA 20、softplus 20、bucket TopK 4、grouped TopK 3、DSA sparse MLA 3、INT8 attention 8。先对同输入做两路数值检查，再使用空闲设备和 CUDA graph 5×40 ms 中位数计时。固定 GEMM 的前后校准容差为 3%，用于检查设备干扰，不代表各算子耗时的置信区间。KDA 的 D=64 类别整体受益于 TLE；其中 T=2048 的 dense 输入实测差异约 1%，该输入沿用同一类别策略。D=128 的短序列 T=32 使用 TLE，T=64/128/256 及更长序列使用普通实现。
 
-受控计时及已有失败的基线对照见[PPU 技术分析](https://jwolpxeehx.feishu.cn/docx/DiTTdZq1poyI2hxpUDncUDe9n37)的验证附件。无 TLE、不同硬件或不同输入类别应重新验证和标定，不能套用本设备的性能结论。
+原语支持与限制、受控计时及已有失败的基线对照见[PPU 编译优化与相关算子](https://jwolpxeehx.feishu.cn/docx/WB3IdPhdDonaOPxXKZgcdiLNnMh)及其验证附件。无 TLE、不同硬件或不同输入类别应重新验证和标定，不能套用本设备的性能结论。
