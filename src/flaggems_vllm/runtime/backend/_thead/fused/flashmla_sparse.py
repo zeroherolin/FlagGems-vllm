@@ -12,30 +12,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Sparse MLA prefill (flash_mla_sparse_fwd) for PPU.
+"""Sparse MLA prefill for PPU, with the generic operator's ABI and semantics.
 
-Same ABI and semantics as ``flaggems_vllm.ops.flashmla_sparse``. The kernel needs
-FlagTree TLE warp specialization on PPU (hardware named barriers); without it the
-generic implementation runs.
+Persistent CTAs distribute query heads and TOPK splits over matrix-capable SMs.
+An eight-warp QK group gathers KV blocks two positions ahead, computes scores,
+and hands each block to an eight-warp PV group for online softmax and P @ V.
+A combine kernel merges TOPK splits when query parallelism is low.
 
-A persistent CTA (one per matrix-instruction SM; 20 of 64 on PPU-ZW810E) runs work
-items pid, pid + grid, ...; an item is BH (64, 32 or 16) heads of one query token over
-a range of 64-key blocks (one split of TOPK). Two warp groups of 8 warps hand over
-through hardware named barriers:
-
-* QK group (default partition): walks the CTA's stream of positions, per item its Q
-  rows, then its key blocks. Position p lives in KV slot p % 3 (and K-tail slot p % 2);
-  the group gathers it two positions ahead with asynchronous copies (invalid keys are
-  zero-filled), computes the scores S = Q K^T of each key block (log2 units, invalid
-  keys -inf) into an S slot and arrives READY. Key indices are copied ahead into a
-  shared-memory ring.
-* PV group (worker partition): waits READY; online softmax with lazy rescaling;
-  O += P V with V the block's KV slot; arrives FREE (the slot can be refilled); writes
-  O, max_logits and lse (or a partial of a TOPK split) per item.
-
-Every READY / FREE arrival is waited for exactly once, so the named-barrier
-generations never alias. Few query tokens are spread over the SMs by smaller head
-blocks and TOPK splits, merged by a combine kernel.
+The default KV ring uses cp.async inline assembly. The opt-in tle.pipe variant
+uses compiler-managed stage ownership for the ring. Each ready/free barrier
+generation is consumed exactly once. Without PPU TLE warp specialization, dispatch
+uses the generic implementation.
 """
 
 import functools
@@ -1714,9 +1701,7 @@ def _has_tle_pipe() -> bool:
 
 
 def _use_pipe() -> bool:
-    """The tle.pipe variant of the kernel, selected with FLAGGEMS_FLASHMLA_SPARSE_PIPE=1.
-    The default keeps the KV ring on cp.async inline assembly, which leaves two gathers
-    in flight."""
+    """Select tle.pipe with FLAGGEMS_FLASHMLA_SPARSE_PIPE=1 when supported."""
     value = os.environ.get("FLAGGEMS_FLASHMLA_SPARSE_PIPE", "0").lower()
     return value in {"1", "true", "on", "yes"} and _has_tle_pipe()
 

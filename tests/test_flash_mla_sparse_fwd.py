@@ -30,8 +30,7 @@ random.seed(42)
     params=["inline_asm", "pipe"] if flaggems_vllm.vendor_name == "thead" else [None],
 )
 def kv_ring_path(request, monkeypatch):
-    """On PPU the kernel has two KV ring implementations (cp.async inline assembly, and
-    tle.pipe); the correctness tests cover both."""
+    """Cover both the inline-assembly and tle.pipe KV rings on PPU."""
     if request.param is not None:
         monkeypatch.setenv(
             "FLAGGEMS_FLASHMLA_SPARSE_PIPE", "1" if request.param == "pipe" else "0"
