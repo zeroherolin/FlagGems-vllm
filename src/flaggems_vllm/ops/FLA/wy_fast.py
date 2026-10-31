@@ -42,7 +42,7 @@ def _use_tle_recompute_w_u(cu_seqlens: torch.Tensor | None) -> bool:
 def maybe_set_tle_recompute_allocator(
     device: torch.device, cu_seqlens: torch.Tensor | None
 ) -> None:
-    if not _use_tle_recompute_w_u(cu_seqlens):
+    if not (HAS_TLE_RECOMPUTE_W_U and cu_seqlens is None):
         return
 
     def alloc_fn(size: int, align: int, stream):

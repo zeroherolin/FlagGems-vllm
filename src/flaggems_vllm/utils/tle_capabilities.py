@@ -29,13 +29,14 @@ def supports_sparse_mla_tle(language):
 def vendor_takes_tle_pipe_kernels():
     """Whether this vendor takes the Hopper TLE kernels built on tle.pipe.
 
-    T-Head PPU compiles them, but its own Triton paths are faster (and the
-    recompute kernel returns wrong values), so it stays on those.
-    FLAGGEMS_FORCE_TLE=1 selects the TLE kernels anyway.
+    T-Head PPU compiles them, but its own Triton paths are faster for dense
+    decode, gated delta rule and recompute, so it stays on those.
+    FLAGGEMS_FORCE_TLE=1 selects the TLE kernels anyway; any other value leaves
+    the choice to the vendor, so the setting that switches off the top-k TLE
+    kernels does not switch off these on other vendors.
     """
-    override = os.environ.get("FLAGGEMS_FORCE_TLE")
-    if override is not None:
-        return override.lower() not in {"0", "false", "off", "no"}
+    if os.environ.get("FLAGGEMS_FORCE_TLE", "").lower() in {"1", "true", "on", "yes"}:
+        return True
     try:
         from flaggems_vllm import runtime
 
